@@ -974,7 +974,10 @@ __v4l2_subdev_state_alloc(struct v4l2_subdev *sd, const char *lock_name,
 	else
 		state->lock = &state->_lock;
 
-	if (sd->entity.num_pads) {
+	state->sd = sd;
+
+	/* Drivers that support streams do not need the legacy pad config */
+	if (!(sd->flags & V4L2_SUBDEV_FL_STREAMS) && sd->entity.num_pads) {
 		state->pads = kvcalloc(sd->entity.num_pads,
 				       sizeof(*state->pads), GFP_KERNEL);
 		if (!state->pads) {
@@ -983,16 +986,28 @@ __v4l2_subdev_state_alloc(struct v4l2_subdev *sd, const char *lock_name,
 		}
 	}
 
-	/*
-	 * There can be no race at this point, but we lock the state anyway to
-	 * satisfy lockdep checks.
-	 */
-	v4l2_subdev_lock_state(state);
-	ret = v4l2_subdev_call(sd, pad, init_cfg, state);
-	v4l2_subdev_unlock_state(state);
+	if (sd->internal_ops && sd->internal_ops->init_state) {
+		/*
+		 * There can be no race at this point, but we lock the state
+		 * anyway to satisfy lockdep checks.
+		 */
+		v4l2_subdev_lock_state(state);
+		ret = sd->internal_ops->init_state(sd, state);
+		v4l2_subdev_unlock_state(state);
 
-	if (ret < 0 && ret != -ENOIOCTLCMD)
-		goto err;
+		if (ret)
+			goto err;
+	} else {
+		/*
+		* There can be no race at this point, but we lock the state anyway to
+		* satisfy lockdep checks.
+		*/
+		v4l2_subdev_lock_state(state);
+		ret = v4l2_subdev_call(sd, pad, init_cfg, state);
+		v4l2_subdev_unlock_state(state);
+		if (ret < 0 && ret != -ENOIOCTLCMD)
+			goto err;
+	}
 
 	return state;
 
