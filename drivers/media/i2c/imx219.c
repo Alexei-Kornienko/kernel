@@ -13,6 +13,7 @@
 #include <linux/i2c.h>
 #include <linux/init.h>
 #include <linux/io.h>
+#include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/of_graph.h>
 #include <linux/slab.h>
@@ -20,37 +21,168 @@
 #include <linux/version.h>
 #include <linux/rk-camera-module.h>
 #include <linux/compat.h>
+#include <linux/fwnode.h>
+#include <media/v4l2-common.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-image-sizes.h>
 #include <media/v4l2-mediabus.h>
+#include <media/v4l2-subdev.h>
 
-#define DRIVER_VERSION			KERNEL_VERSION(0, 0x01, 0x1)
+/* Register addresses and constants shared with the upstream driver */
+#define IMX219_REG_CHIP_ID 0x0000
+#define IMX219_CHIP_ID 0x0219
+
+#define IMX219_REG_MODE_SELECT 0x0100
+#define IMX219_MODE_STANDBY 0x00
+#define IMX219_MODE_STREAMING 0x01
+
+#define IMX219_REG_CSI_LANE_MODE 0x0114
+#define IMX219_CSI_2_LANE_MODE 0x01
+#define IMX219_CSI_4_LANE_MODE 0x03
+
+#define IMX219_REG_DPHY_CTRL 0x0128
+#define IMX219_DPHY_CTRL_TIMING_AUTO 0
+#define IMX219_DPHY_CTRL_TIMING_MANUAL 1
+
+#define IMX219_REG_EXCK_FREQ 0x012a
+#define IMX219_EXCK_FREQ(n) ((n) * 256) /* n expressed in MHz */
+
+/* Analog gain control */
+#define IMX219_REG_ANALOG_GAIN 0x0157
+#define IMX219_ANA_GAIN_MIN 0
+#define IMX219_ANA_GAIN_MAX 232
+#define IMX219_ANA_GAIN_STEP 1
+#define IMX219_ANA_GAIN_DEFAULT 0x0
+
+/* Digital gain control */
+#define IMX219_REG_DIGITAL_GAIN 0x0158
+#define IMX219_DGTL_GAIN_MIN 0x0100
+#define IMX219_DGTL_GAIN_MAX 0x0fff
+#define IMX219_DGTL_GAIN_DEFAULT 0x0100
+#define IMX219_DGTL_GAIN_STEP 1
+
+/* Exposure control */
+#define IMX219_REG_EXPOSURE 0x015a
+#define IMX219_EXPOSURE_MIN 4
+#define IMX219_EXPOSURE_STEP 1
+#define IMX219_EXPOSURE_DEFAULT 0x640
+#define IMX219_EXPOSURE_MAX 65535
+
+/* V_TIMING internal */
+#define IMX219_REG_VTS 0x0160
+#define IMX219_VTS_MAX 0xffff
+
+#define IMX219_VBLANK_MIN 32
+
+/* HBLANK control - read only */
+#define IMX219_PPL_DEFAULT 3448
+
+#define IMX219_REG_LINE_LENGTH_A 0x0162
+#define IMX219_REG_X_ADD_STA_A 0x0164
+#define IMX219_REG_X_ADD_END_A 0x0166
+#define IMX219_REG_Y_ADD_STA_A 0x0168
+#define IMX219_REG_Y_ADD_END_A 0x016a
+#define IMX219_REG_X_OUTPUT_SIZE 0x016c
+#define IMX219_REG_Y_OUTPUT_SIZE 0x016e
+#define IMX219_REG_X_ODD_INC_A 0x0170
+#define IMX219_REG_Y_ODD_INC_A 0x0171
+#define IMX219_REG_ORIENTATION 0x0172
+
+/* Binning  Mode */
+#define IMX219_REG_BINNING_MODE_H 0x0174
+#define IMX219_REG_BINNING_MODE_V 0x0175
+#define IMX219_BINNING_NONE 0x00
+#define IMX219_BINNING_X2 0x01
+#define IMX219_BINNING_X2_ANALOG 0x03
+
+#define IMX219_REG_CSI_DATA_FORMAT_A 0x018c
+
+/* PLL Settings */
+#define IMX219_REG_VTPXCK_DIV 0x0301
+#define IMX219_REG_VTSYCK_DIV 0x0303
+#define IMX219_REG_PREPLLCK_VT_DIV 0x0304
+#define IMX219_REG_PREPLLCK_OP_DIV 0x0305
+#define IMX219_REG_PLL_VT_MPY 0x0306
+#define IMX219_REG_OPPXCK_DIV 0x0309
+#define IMX219_REG_OPSYCK_DIV 0x030b
+#define IMX219_REG_PLL_OP_MPY 0x030c
+
+/* Test Pattern Control */
+#define IMX219_REG_TEST_PATTERN 0x0600
+#define IMX219_TEST_PATTERN_DISABLE 0
+#define IMX219_TEST_PATTERN_SOLID_COLOR 1
+#define IMX219_TEST_PATTERN_COLOR_BARS 2
+#define IMX219_TEST_PATTERN_GREY_COLOR 3
+#define IMX219_TEST_PATTERN_PN9 4
+
+/* Test pattern colour components */
+#define IMX219_REG_TESTP_RED 0x0602
+#define IMX219_REG_TESTP_GREENR 0x0604
+#define IMX219_REG_TESTP_BLUE 0x0606
+#define IMX219_REG_TESTP_GREENB 0x0608
+#define IMX219_TESTP_COLOUR_MIN 0
+#define IMX219_TESTP_COLOUR_MAX 0x03ff
+#define IMX219_TESTP_COLOUR_STEP 1
+
+#define IMX219_REG_TP_WINDOW_WIDTH 0x0624
+#define IMX219_REG_TP_WINDOW_HEIGHT 0x0626
+
+/* External clock frequency is 24.0M */
+#define IMX219_XCLK_FREQ 24000000
+
+/* Pixel rate is fixed for all the modes */
+#define IMX219_PIXEL_RATE 182400000
+#define IMX219_PIXEL_RATE_4LANE 281600000
+
+#define IMX219_DEFAULT_LINK_FREQ 456000000
+#define IMX219_DEFAULT_LINK_FREQ_4LANE_UNSUPPORTED 363000000
+#define IMX219_DEFAULT_LINK_FREQ_4LANE 364000000
+
+/* IMX219 native and active pixel array size. */
+#define IMX219_NATIVE_WIDTH 3296U
+#define IMX219_NATIVE_HEIGHT 2480U
+#define IMX219_PIXEL_ARRAY_LEFT 8U
+#define IMX219_PIXEL_ARRAY_TOP 8U
+#define IMX219_PIXEL_ARRAY_WIDTH 3280U
+#define IMX219_PIXEL_ARRAY_HEIGHT 2464U
+
+enum binning_bit_depths {
+	BINNING_IDX_8_BIT,
+	BINNING_IDX_10_BIT,
+	BINNING_IDX_MAX
+};
+
+#define DRIVER_VERSION KERNEL_VERSION(0, 0x01, 0x1)
 
 /* IMX219 supported geometry */
-#define IMX219_TABLE_END		0xffff
-#define IMX219_ANALOGUE_GAIN_MULTIPLIER	256
-#define IMX219_ANALOGUE_GAIN_MIN	(1 * IMX219_ANALOGUE_GAIN_MULTIPLIER)
-#define IMX219_ANALOGUE_GAIN_MAX	(11 * IMX219_ANALOGUE_GAIN_MULTIPLIER)
-#define IMX219_ANALOGUE_GAIN_DEFAULT	(2 * IMX219_ANALOGUE_GAIN_MULTIPLIER)
+#define IMX219_TABLE_END 0xffff
+#define IMX219_ANALOGUE_GAIN_MULTIPLIER 256
+#define IMX219_ANALOGUE_GAIN_MIN (1 * IMX219_ANALOGUE_GAIN_MULTIPLIER)
+#define IMX219_ANALOGUE_GAIN_MAX (11 * IMX219_ANALOGUE_GAIN_MULTIPLIER)
+#define IMX219_ANALOGUE_GAIN_DEFAULT (2 * IMX219_ANALOGUE_GAIN_MULTIPLIER)
 
 /* In dB*256 */
-#define IMX219_DIGITAL_GAIN_MIN		256
-#define IMX219_DIGITAL_GAIN_MAX		43663
-#define IMX219_DIGITAL_GAIN_DEFAULT	256
+#define IMX219_DIGITAL_GAIN_MIN 256
+#define IMX219_DIGITAL_GAIN_MAX 43663
+#define IMX219_DIGITAL_GAIN_DEFAULT 256
 
-#define IMX219_DIGITAL_EXPOSURE_MIN	0
-#define IMX219_DIGITAL_EXPOSURE_MAX	4095
-#define IMX219_DIGITAL_EXPOSURE_DEFAULT	1575
+#define IMX219_DIGITAL_EXPOSURE_MIN 0
+#define IMX219_DIGITAL_EXPOSURE_MAX 4095
+#define IMX219_DIGITAL_EXPOSURE_DEFAULT 1575
 
-#define IMX219_EXP_LINES_MARGIN	4
+#define IMX219_EXP_LINES_MARGIN 4
 
-#define IMX219_NAME			"imx219"
-#define IMX219_LANES  			2
+#define IMX219_NAME "imx219"
+#define IMX219_LANES 2
 
-static const s64 link_freq_menu_items[] = {
-	456000000,
+static const s64 link_freq_menu_2lanes[] = {
+	IMX219_DEFAULT_LINK_FREQ,
+};
+
+static const s64 link_freq_menu_4lanes[] = {
+	IMX219_DEFAULT_LINK_FREQ_4LANE,
 };
 
 struct imx219_reg {
@@ -64,269 +196,75 @@ struct imx219_mode {
 	struct v4l2_fract max_fps;
 	u32 hts_def;
 	u32 vts_def;
-	const struct imx219_reg *reg_list;
+	unsigned int binning[BINNING_IDX_MAX];
 };
 
-/* MCLK:24MHz  3280x2464  21.2fps   MIPI LANE2 */
-static const struct imx219_reg imx219_init_tab_3280_2464_21fps[] = {
-	{0x0114, 0x01},
-	{0x30eb, 0x0c},
-	{0x30eb, 0x05},
-	{0x300a, 0xff},
-	{0x300b, 0xff},
-	{0x30eb, 0x05},
-	{0x30eb, 0x09},
-	{0x0128, 0x00},
-	{0x012a, 0x18},
-	{0x012b, 0x00},
-	{0x0164, 0x00},
-	{0x0165, 0x00},
-	{0x0166, 0x0c},
-	{0x0167, 0xcf},
-	{0x0168, 0x00},
-	{0x0169, 0x00},
-	{0x016a, 0x09},
-	{0x016b, 0x9f},
-	{0x016c, 0x0c},
-	{0x016d, 0xd0},
-	{0x016e, 0x09},
-	{0x016f, 0xa0},
-	{0x0170, 0x01},
-	{0x0171, 0x01},
-	{0x0174, 0x00},
-	{0x0175, 0x00},
-	{0x0301, 0x05},
-	{0x0303, 0x01},
-	{0x0304, 0x03},
-	{0x0305, 0x03},
-	{0x0306, 0x00},
-	{0x0307, 0x39},
-	{0x030b, 0x01},
-	{0x030c, 0x00},
-	{0x030d, 0x72},
-	{0x0624, 0x0c},
-	{0x0625, 0xd0},
-	{0x0626, 0x09},
-	{0x0627, 0xa0},
-	{0x455e, 0x00},
-	{0x471e, 0x4b},
-	{0x4767, 0x0f},
-	{0x4750, 0x14},
-	{0x4540, 0x00},
-	{0x47b4, 0x14},
-	{0x4713, 0x30},
-	{0x478b, 0x10},
-	{0x478f, 0x10},
-	{0x4793, 0x10},
-	{0x4797, 0x0e},
-	{0x479b, 0x0e},
-	{0x0162, 0x0d},
-	{0x0163, 0x78},
-	{0x0172, 0x00},
-	{IMX219_TABLE_END, 0x00},
+static const struct imx219_reg imx219_common_regs[] = {
+	{ IMX219_REG_MODE_SELECT, IMX219_MODE_STANDBY },
+	{ 0x30eb, 0x05 },
+	{ 0x30eb, 0x0c },
+	{ 0x300a, 0xff },
+	{ 0x300b, 0xff },
+	{ 0x30eb, 0x05 },
+	{ 0x30eb, 0x09 },
+	{ IMX219_REG_DPHY_CTRL, IMX219_DPHY_CTRL_TIMING_AUTO },
+	{ IMX219_REG_EXCK_FREQ, 0x18 },
+	{ IMX219_REG_EXCK_FREQ + 1, 0x00 },
+	{ IMX219_REG_LINE_LENGTH_A, 0x0d },
+	{ IMX219_REG_LINE_LENGTH_A + 1, 0x78 },
+	{ IMX219_REG_X_ODD_INC_A, 0x01 },
+	{ IMX219_REG_Y_ODD_INC_A, 0x01 },
+	{ 0x455e, 0x00 },
+	{ 0x471e, 0x4b },
+	{ 0x4767, 0x0f },
+	{ 0x4750, 0x14 },
+	{ 0x4540, 0x00 },
+	{ 0x47b4, 0x14 },
+	{ 0x4713, 0x30 },
+	{ 0x478b, 0x10 },
+	{ 0x478f, 0x10 },
+	{ 0x4793, 0x10 },
+	{ 0x4797, 0x0e },
+	{ 0x479b, 0x0e },
+	{ IMX219_TABLE_END, 0x00 },
 };
 
-/* MCLK:24MHz  1920x1080  30fps   MIPI LANE2 */
-static const struct imx219_reg imx219_init_tab_1920_1080_30fps[] = {
-	{0x30EB, 0x05},
-	{0x30EB, 0x0C},
-	{0x300A, 0xFF},
-	{0x300B, 0xFF},
-	{0x30EB, 0x05},
-	{0x30EB, 0x09},
-	{0x0114, 0x01},
-	{0x0128, 0x00},
-	{0x012A, 0x18},
-	{0x012B, 0x00},
-	{0x0160, 0x06},
-	{0x0161, 0xE6},
-	{0x0162, 0x0D},
-	{0x0163, 0x78},
-	{0x0164, 0x02},
-	{0x0165, 0xA8},
-	{0x0166, 0x0A},
-	{0x0167, 0x27},
-	{0x0168, 0x02},
-	{0x0169, 0xB4},
-	{0x016A, 0x06},
-	{0x016B, 0xEB},
-	{0x016C, 0x07},
-	{0x016D, 0x80},
-	{0x016E, 0x04},
-	{0x016F, 0x38},
-	{0x0170, 0x01},
-	{0x0171, 0x01},
-	{0x0172, 0x00},
-	{0x0174, 0x00},
-	{0x0175, 0x00},
-	{0x0176, 0x01},
-	{0x0177, 0x01},
-	{0x018C, 0x0A},
-	{0x018D, 0x0A},
-	{0x0301, 0x05},
-	{0x0303, 0x01},
-	{0x0304, 0x03},
-	{0x0305, 0x03},
-	{0x0306, 0x00},
-	{0x0307, 0x39},
-	{0x0309, 0x0A},
-	{0x030B, 0x01},
-	{0x030C, 0x00},
-	{0x030D, 0x72},
-	{0x455E, 0x00},
-	{0x471E, 0x4B},
-	{0x4767, 0x0F},
-	{0x4750, 0x14},
-	{0x4540, 0x00},
-	{0x47B4, 0x14},
-	{IMX219_TABLE_END, 0x00}
+static const struct imx219_reg imx219_2lane_regs[] = {
+	{ IMX219_REG_VTPXCK_DIV, 0x05 },
+	{ IMX219_REG_VTSYCK_DIV, 0x01 },
+	{ IMX219_REG_PREPLLCK_VT_DIV, 0x03 },
+	{ IMX219_REG_PREPLLCK_OP_DIV, 0x03 },
+	{ IMX219_REG_PLL_VT_MPY, 0x00 },
+	{ IMX219_REG_PLL_VT_MPY + 1, 0x39 },
+	{ IMX219_REG_OPSYCK_DIV, 0x01 },
+	{ IMX219_REG_PLL_OP_MPY, 0x00 },
+	{ IMX219_REG_PLL_OP_MPY + 1, 0x72 },
+	{ IMX219_REG_CSI_LANE_MODE, IMX219_CSI_2_LANE_MODE },
+	{ IMX219_TABLE_END, 0x00 },
 };
 
-
-static const struct imx219_reg mode_1640_1232_regs[] = {
-	{0x0100, 0x00},
-	{0x30eb, 0x05},
-	{0x30eb, 0x0c},
-	{0x300a, 0xff},
-	{0x300b, 0xff},
-	{0x30eb, 0x05},
-	{0x30eb, 0x09},
-	{0x0114, 0x01},
-	{0x0128, 0x00},
-	{0x012a, 0x18},
-	{0x012b, 0x00},
-	{0x0160, 0x06},
-	{0x0161, 0xe6},
-	{0x0162, 0x0d},
-	{0x0163, 0x78},
-	{0x0164, 0x00},
-	{0x0165, 0x00},
-	{0x0166, 0x0c},
-	{0x0167, 0xcf},
-	{0x0168, 0x00},
-	{0x0169, 0x00},
-	{0x016a, 0x09},
-	{0x016b, 0x9f},
-	{0x016c, 0x06},
-	{0x016d, 0x68},
-	{0x016e, 0x04},
-	{0x016f, 0xd0},
-	{0x0170, 0x01},
-	{0x0171, 0x01},
-	{0x0172, 0x00},
-	{0x0174, 0x01},
-	{0x0175, 0x01},
-	{0x0176, 0x01},
-	{0x0177, 0x01},
-	{0x018C, 0x0a},
-	{0x018D, 0x0a},
-	{0x0301, 0x05},
-	{0x0303, 0x01},
-	{0x0304, 0x03},
-	{0x0305, 0x03},
-	{0x0306, 0x00},
-	{0x0307, 0x39},
-	{0x0309, 0x0a},
-	{0x030b, 0x01},
-	{0x030c, 0x00},
-	{0x030d, 0x72},
-	{0x0624, 0x06},
-	{0x0625, 0x68},
-	{0x0626, 0x04},
-	{0x0627, 0xd0},
-	{0x455e, 0x00},
-	{0x471e, 0x4b},
-	{0x4767, 0x0f},
-	{0x4750, 0x14},
-	{0x4540, 0x00},
-	{0x47b4, 0x14},
-	{0x4713, 0x30},
-	{0x478b, 0x10},
-	{0x478f, 0x10},
-	{0x4793, 0x10},
-	{0x4797, 0x0e},
-	{0x479b, 0x0e},
-	{0x0162, 0x0d},
-	{0x0163, 0x78},
-	{IMX219_TABLE_END, 0x00},
-};
-
-static const struct imx219_reg mode_640_480_regs[] = {
-	{0x0100, 0x00},
-	{0x30eb, 0x05},
-	{0x30eb, 0x0c},
-	{0x300a, 0xff},
-	{0x300b, 0xff},
-	{0x30eb, 0x05},
-	{0x30eb, 0x09},
-	{0x0114, 0x01},
-	{0x0128, 0x00},
-	{0x012a, 0x18},
-	{0x012b, 0x00},
-	{0x0160, 0x06},
-	{0x0161, 0xe6},
-	{0x0162, 0x0d},
-	{0x0163, 0x78},
-	{0x0164, 0x03},
-	{0x0165, 0xe8},
-	{0x0166, 0x08},
-	{0x0167, 0xe7},
-	{0x0168, 0x02},
-	{0x0169, 0xf0},
-	{0x016a, 0x06},
-	{0x016b, 0xaf},
-	{0x016c, 0x02},
-	{0x016d, 0x80},
-	{0x016e, 0x01},
-	{0x016f, 0xe0},
-	{0x0170, 0x01},
-	{0x0171, 0x01},
-	{0x0172, 0x00},
-	{0x0174, 0x00},
-	{0x0175, 0x00},
-	{0x0176, 0x01},
-	{0x0177, 0x01},
-	{0x018C, 0x0a},
-	{0x018D, 0x0a},
-	{0x0301, 0x05},
-	{0x0303, 0x01},
-	{0x0304, 0x03},
-	{0x0305, 0x03},
-	{0x0306, 0x00},
-	{0x0307, 0x39},
-	{0x0309, 0x0a},
-	{0x030b, 0x01},
-	{0x030c, 0x00},
-	{0x030d, 0x72},
-	{0x0624, 0x06},
-	{0x0625, 0x68},
-	{0x0626, 0x04},
-	{0x0627, 0xd0},
-	{0x455e, 0x00},
-	{0x471e, 0x4b},
-	{0x4767, 0x0f},
-	{0x4750, 0x14},
-	{0x4540, 0x00},
-	{0x47b4, 0x14},
-	{0x4713, 0x30},
-	{0x478b, 0x10},
-	{0x478f, 0x10},
-	{0x4793, 0x10},
-	{0x4797, 0x0e},
-	{0x479b, 0x0e},
-	{0x0162, 0x0d},
-	{0x0163, 0x78},
-	{IMX219_TABLE_END, 0x00},
+static const struct imx219_reg imx219_4lane_regs[] = {
+	{ IMX219_REG_VTPXCK_DIV, 0x05 },
+	{ IMX219_REG_VTSYCK_DIV, 0x01 },
+	{ IMX219_REG_PREPLLCK_VT_DIV, 0x03 },
+	{ IMX219_REG_PREPLLCK_OP_DIV, 0x03 },
+	{ IMX219_REG_PLL_VT_MPY, 0x00 },
+	{ IMX219_REG_PLL_VT_MPY + 1, 0x58 },
+	{ IMX219_REG_OPSYCK_DIV, 0x01 },
+	{ IMX219_REG_PLL_OP_MPY, 0x00 },
+	{ IMX219_REG_PLL_OP_MPY + 1, 0x5b },
+	{ IMX219_REG_CSI_LANE_MODE, IMX219_CSI_4_LANE_MODE },
+	{ IMX219_TABLE_END, 0x00 },
 };
 
 static const struct imx219_reg start[] = {
-	{0x0100, 0x01},		/* mode select streaming on */
-	{IMX219_TABLE_END, 0x00}
+	{ 0x0100, 0x01 }, /* mode select streaming on */
+	{ IMX219_TABLE_END, 0x00 }
 };
 
 static const struct imx219_reg stop[] = {
-	{0x0100, 0x00},		/* mode select streaming off */
-	{IMX219_TABLE_END, 0x00}
+	{ 0x0100, 0x00 }, /* mode select streaming off */
+	{ IMX219_TABLE_END, 0x00 }
 };
 
 enum {
@@ -372,10 +310,11 @@ struct imx219 {
 	struct v4l2_ctrl_handler ctrl_handler;
 	struct clk *clk;
 	struct v4l2_rect crop_rect;
+	struct v4l2_mbus_framefmt fmt;
 	int hflip;
 	int vflip;
 	u8 analogue_gain;
-	u16 digital_gain;	/* bits 11:0 */
+	u16 digital_gain; /* bits 11:0 */
 	u16 exposure_time;
 	u16 test_pattern;
 	u16 test_pattern_solid_color_r;
@@ -385,6 +324,7 @@ struct imx219 {
 	struct v4l2_ctrl *hblank;
 	struct v4l2_ctrl *vblank;
 	struct v4l2_ctrl *pixel_rate;
+	struct v4l2_ctrl *link_freq;
 	const struct imx219_mode *cur_mode;
 	u32 cfg_num;
 	u16 cur_vts;
@@ -392,55 +332,124 @@ struct imx219 {
 	const char *module_facing;
 	const char *module_name;
 	const char *len_name;
+	u8 lanes;
 };
 
 static const struct imx219_mode supported_modes[] = {
-	{
-		.width = 1920,
-		.height = 1080,
-		.max_fps = {
-			.numerator = 10000,
-			.denominator = 300000,
-		},
-		.hts_def = 0x0d78 - IMX219_EXP_LINES_MARGIN,
-		.vts_def = 0x06E6,
-		.reg_list = imx219_init_tab_1920_1080_30fps,
-	},
-	{
-		.width = 3280,
-		.height = 2464,
-		.max_fps = {
-			.numerator = 10000,
-			.denominator = 210000,
-		},
-		.hts_def = 0x0d78 - IMX219_EXP_LINES_MARGIN,
-		.vts_def = 0x09c4,
-		.reg_list = imx219_init_tab_3280_2464_21fps,
-	},
-	{
-		/* 2x2 binned 30fps mode */
-		.width = 1640,
-		.height = 1232,
-		.max_fps = {
-			.numerator = 10000,
-			.denominator = 300000,
-		},
-		.vts_def = 0x06e3,
-		.reg_list = mode_1640_1232_regs,
-	},
-	{
-		/* 640x480 30fps mode */
-		.width = 640,
-		.height = 480,
-		.max_fps = {
-			.numerator = 10000,
-			.denominator = 300000,
-		},
-		.hts_def = 0x0d78 - IMX219_EXP_LINES_MARGIN,
-		.vts_def = 0x0437,
-		.reg_list = mode_640_480_regs,
+    {
+        .width = 1920,
+        .height = 1080,
+        .max_fps = {
+            .numerator = 10000,
+            .denominator = 300000,
+        },
+        .hts_def = 0x0d78 - IMX219_EXP_LINES_MARGIN,
+        .vts_def = 0x06E6,
+        .binning = {
+            [BINNING_IDX_8_BIT] = IMX219_BINNING_NONE,
+            [BINNING_IDX_10_BIT] = IMX219_BINNING_NONE,
+        },
+    },
+    {
+        .width = 3280,
+        .height = 2464,
+        .max_fps = {
+            .numerator = 10000,
+            .denominator = 210000,
+        },
+        .hts_def = 0x0d78 - IMX219_EXP_LINES_MARGIN,
+        .vts_def = 0x09c4,
+        .binning = {
+            [BINNING_IDX_8_BIT] = IMX219_BINNING_NONE,
+            [BINNING_IDX_10_BIT] = IMX219_BINNING_NONE,
+        },
+    },
+    {
+        /* 2x2 binned 30fps mode */
+        .width = 1640,
+        .height = 1232,
+        .max_fps = {
+            .numerator = 10000,
+            .denominator = 300000,
+        },
+        .vts_def = 0x06e3,
+        .binning = {
+            [BINNING_IDX_8_BIT] = IMX219_BINNING_X2_ANALOG,
+            [BINNING_IDX_10_BIT] = IMX219_BINNING_X2,
+        },
+    },
+    {
+        /* 640x480 30fps mode */
+        .width = 640,
+        .height = 480,
+        .max_fps = {
+            .numerator = 10000,
+            .denominator = 300000,
+        },
+        .hts_def = 0x0d78 - IMX219_EXP_LINES_MARGIN,
+        .vts_def = 0x0437,
+        .binning = {
+            [BINNING_IDX_8_BIT] = IMX219_BINNING_X2_ANALOG,
+            [BINNING_IDX_10_BIT] = IMX219_BINNING_X2_ANALOG,
+        },
+    }};
+
+static void imx219_update_pad_format(const struct imx219_mode *mode,
+				     struct v4l2_mbus_framefmt *fmt)
+{
+	fmt->width = mode->width;
+	fmt->height = mode->height;
+	fmt->code = MEDIA_BUS_FMT_SRGGB10_1X10;
+	fmt->field = V4L2_FIELD_NONE;
+	fmt->colorspace = V4L2_COLORSPACE_RAW;
+	fmt->ycbcr_enc = V4L2_YCBCR_ENC_601;
+	fmt->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+	fmt->xfer_func = V4L2_XFER_FUNC_NONE;
+}
+
+static void imx219_compose_centered_crop(struct v4l2_rect *crop,
+					 const struct v4l2_mbus_framefmt *fmt)
+{
+	unsigned int bin_h = min(IMX219_PIXEL_ARRAY_WIDTH / fmt->width, 2U);
+	unsigned int bin_v = min(IMX219_PIXEL_ARRAY_HEIGHT / fmt->height, 2U);
+	unsigned int binning = min(bin_h, bin_v);
+
+	crop->width = fmt->width * binning;
+	crop->height = fmt->height * binning;
+	crop->left = (IMX219_NATIVE_WIDTH - crop->width) / 2;
+	crop->top = (IMX219_NATIVE_HEIGHT - crop->height) / 2;
+}
+
+static unsigned int imx219_get_binning_mode(struct imx219 *priv, u8 *bin_h,
+					    u8 *bin_v)
+{
+	unsigned int mode_bin = priv->cur_mode->binning[BINNING_IDX_10_BIT];
+
+	*bin_h = priv->crop_rect.width / priv->fmt.width;
+	*bin_v = priv->crop_rect.height / priv->fmt.height;
+
+	if (*bin_h == 2 && *bin_v == 2)
+		return mode_bin;
+
+	if (*bin_h == 2 || *bin_v == 2)
+		return IMX219_BINNING_X2;
+
+	return IMX219_BINNING_NONE;
+}
+
+static u8 imx219_get_format_bpp(const struct imx219 *priv)
+{
+	switch (priv->fmt.code) {
+	case MEDIA_BUS_FMT_SRGGB10_1X10:
+	default:
+		return 10;
 	}
-};
+}
+
+static u64 imx219_get_pixel_rate(const struct imx219 *priv)
+{
+	return (priv->lanes == 4) ? IMX219_PIXEL_RATE_4LANE : IMX219_PIXEL_RATE;
+}
 
 static struct imx219 *to_imx219(const struct i2c_client *client)
 {
@@ -469,19 +478,20 @@ static int reg_write(struct i2c_client *client, const u16 addr, const u8 data)
 
 static int reg_read(struct i2c_client *client, const u16 addr)
 {
-	u8 buf[2] = {addr >> 8, addr & 0xff};
+	u8 buf[2] = { addr >> 8, addr & 0xff };
 	int ret;
 	struct i2c_msg msgs[] = {
 		{
-			.addr  = client->addr,
+			.addr = client->addr,
 			.flags = 0,
-			.len   = 2,
-			.buf   = buf,
-		}, {
-			.addr  = client->addr,
+			.len = 2,
+			.buf = buf,
+		},
+		{
+			.addr = client->addr,
 			.flags = I2C_M_RD,
-			.len   = 1,
-			.buf   = buf,
+			.len = 1,
+			.buf = buf,
 		},
 	};
 
@@ -511,6 +521,81 @@ static int reg_write_table(struct i2c_client *client,
 }
 
 /* V4L2 subdev video operations */
+static int imx219_program_format(struct imx219 *priv)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(&priv->subdev);
+	u8 bin_h = 1, bin_v = 1;
+	u8 bpp = imx219_get_format_bpp(priv);
+	unsigned int binning;
+	u16 x_start, y_start, x_end, y_end;
+	int ret;
+
+	x_start = priv->crop_rect.left - IMX219_PIXEL_ARRAY_LEFT;
+	y_start = priv->crop_rect.top - IMX219_PIXEL_ARRAY_TOP;
+	x_end = x_start + priv->crop_rect.width - 1;
+	y_end = y_start + priv->crop_rect.height - 1;
+
+	ret = reg_write(client, 0x0164, x_start >> 8);
+	ret |= reg_write(client, 0x0165, x_start & 0xff);
+	ret |= reg_write(client, 0x0166, x_end >> 8);
+	ret |= reg_write(client, 0x0167, x_end & 0xff);
+	ret |= reg_write(client, 0x0168, y_start >> 8);
+	ret |= reg_write(client, 0x0169, y_start & 0xff);
+	ret |= reg_write(client, 0x016A, y_end >> 8);
+	ret |= reg_write(client, 0x016B, y_end & 0xff);
+	ret |= reg_write(client, 0x016C, priv->fmt.width >> 8);
+	ret |= reg_write(client, 0x016D, priv->fmt.width & 0xff);
+	ret |= reg_write(client, 0x016E, priv->fmt.height >> 8);
+	ret |= reg_write(client, 0x016F, priv->fmt.height & 0xff);
+	if (ret)
+		return ret;
+
+	binning = imx219_get_binning_mode(priv, &bin_h, &bin_v);
+	ret = reg_write(client, 0x0174,
+			(bin_h == 2) ? binning : IMX219_BINNING_NONE);
+	ret |= reg_write(client, 0x0175,
+			 (bin_v == 2) ? binning : IMX219_BINNING_NONE);
+	if (ret)
+		return ret;
+
+	/* Test pattern window always matches current output size */
+	ret = reg_write(client, 0x0624, priv->fmt.width >> 8);
+	ret |= reg_write(client, 0x0625, priv->fmt.width & 0xff);
+	ret |= reg_write(client, 0x0626, priv->fmt.height >> 8);
+	ret |= reg_write(client, 0x0627, priv->fmt.height & 0xff);
+
+	if (ret)
+		return ret;
+
+	/* CSI data format: SRGGB10 -> 10bpp */
+	ret = reg_write(client, 0x018c, bpp);
+	ret |= reg_write(client, 0x018d, bpp);
+	ret |= reg_write(client, 0x0309, bpp);
+
+	return ret;
+}
+
+static int imx219_set_vts(struct imx219 *priv, u16 vts)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(&priv->subdev);
+	int ret;
+
+	ret = reg_write(client, 0x0160, vts >> 8);
+	ret |= reg_write(client, 0x0161, vts & 0xff);
+
+	return ret;
+}
+
+static int imx219_configure_lanes(struct imx219 *priv)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(&priv->subdev);
+	const struct imx219_reg *table;
+
+	table = (priv->lanes == 4) ? imx219_4lane_regs : imx219_2lane_regs;
+
+	return reg_write_table(client, table);
+}
+
 static int imx219_s_stream(struct v4l2_subdev *sd, int enable)
 {
 	struct i2c_client *client = v4l2_get_subdevdata(sd);
@@ -521,24 +606,15 @@ static int imx219_s_stream(struct v4l2_subdev *sd, int enable)
 	if (!enable)
 		return reg_write_table(client, stop);
 
-	ret = reg_write_table(client, priv->cur_mode->reg_list);
+	ret = reg_write_table(client, imx219_common_regs);
 	if (ret)
 		return ret;
 
-	/* Handle crop */
-	// ret = reg_write(client, 0x0164, priv->crop_rect.left >> 8);
-	// ret |= reg_write(client, 0x0165, priv->crop_rect.left & 0xff);
-	// ret |= reg_write(client, 0x0166, (priv->crop_rect.left + priv->crop_rect.width - 1) >> 8);
-	// ret |= reg_write(client, 0x0167, (priv->crop_rect.left + priv->crop_rect.width - 1) & 0xff);
-	// ret |= reg_write(client, 0x0168, priv->crop_rect.top >> 8);
-	// ret |= reg_write(client, 0x0169, priv->crop_rect.top & 0xff);
-	// ret |= reg_write(client, 0x016A, (priv->crop_rect.top + priv->crop_rect.height - 1) >> 8);
-	// ret |= reg_write(client, 0x016B, (priv->crop_rect.top + priv->crop_rect.height - 1) & 0xff);
-	// ret |= reg_write(client, 0x016C, priv->crop_rect.width >> 8);
-	// ret |= reg_write(client, 0x016D, priv->crop_rect.width & 0xff);
-	// ret |= reg_write(client, 0x016E, priv->crop_rect.height >> 8);
-	// ret |= reg_write(client, 0x016F, priv->crop_rect.height & 0xff);
+	ret = imx219_configure_lanes(priv);
+	if (ret)
+		return ret;
 
+	ret = imx219_program_format(priv);
 	if (ret)
 		return ret;
 
@@ -572,19 +648,16 @@ static int imx219_s_stream(struct v4l2_subdev *sd, int enable)
 				 priv->test_pattern_solid_color_gb >> 8);
 		ret |= reg_write(client, 0x0609,
 				 priv->test_pattern_solid_color_gb & 0xff);
-		ret |= reg_write(client, 0x0620, priv->crop_rect.left >> 8);
-		ret |= reg_write(client, 0x0621, priv->crop_rect.left & 0xff);
-		ret |= reg_write(client, 0x0622, priv->crop_rect.top >> 8);
-		ret |= reg_write(client, 0x0623, priv->crop_rect.top & 0xff);
-		ret |= reg_write(client, 0x0624, priv->crop_rect.width >> 8);
-		ret |= reg_write(client, 0x0625, priv->crop_rect.width & 0xff);
-		ret |= reg_write(client, 0x0626, priv->crop_rect.height >> 8);
-		ret |= reg_write(client, 0x0627, priv->crop_rect.height & 0xff);
+		ret |= reg_write(client, 0x0620, 0x00);
+		ret |= reg_write(client, 0x0621, 0x00);
+		ret |= reg_write(client, 0x0622, 0x00);
+		ret |= reg_write(client, 0x0623, 0x00);
 	} else {
 		ret = reg_write(client, 0x0600, 0x00);
 		ret |= reg_write(client, 0x0601, 0x00);
 	}
 
+	ret |= imx219_set_vts(priv, priv->cur_mode->vts_def);
 	priv->cur_vts = priv->cur_mode->vts_def - IMX219_EXP_LINES_MARGIN;
 	if (ret)
 		return ret;
@@ -598,7 +671,7 @@ static int imx219_s_power(struct v4l2_subdev *sd, int on)
 	struct i2c_client *client = v4l2_get_subdevdata(sd);
 	struct imx219 *priv = to_imx219(client);
 
-	if (on)	{
+	if (on) {
 		dev_dbg(&client->dev, "imx219 power on\n");
 		clk_prepare_enable(priv->clk);
 	} else if (!on) {
@@ -613,7 +686,7 @@ static int imx219_s_power(struct v4l2_subdev *sd, int on)
 static int imx219_s_ctrl_test_pattern(struct v4l2_ctrl *ctrl)
 {
 	struct imx219 *priv =
-	    container_of(ctrl->handler, struct imx219, ctrl_handler);
+		container_of(ctrl->handler, struct imx219, ctrl_handler);
 
 	switch (ctrl->val) {
 	case TEST_PATTERN_DISABLED:
@@ -700,7 +773,7 @@ static int imx219_g_frame_interval(struct v4l2_subdev *sd,
 static int imx219_s_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct imx219 *priv =
-	    container_of(ctrl->handler, struct imx219, ctrl_handler);
+		container_of(ctrl->handler, struct imx219, ctrl_handler);
 	struct i2c_client *client = v4l2_get_subdevdata(&priv->subdev);
 	u8 reg;
 	int ret;
@@ -720,9 +793,9 @@ static int imx219_s_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_ANALOGUE_GAIN:
 	case V4L2_CID_GAIN:
 		/*
-		 * hal transfer (gain * 256)  to kernel
-		 * than divide into analog gain & digital gain in kernel
-		 */
+         * hal transfer (gain * 256)  to kernel
+         * than divide into analog gain & digital gain in kernel
+         */
 
 		gain = ctrl->val;
 		if (gain < 256)
@@ -738,11 +811,11 @@ static int imx219_s_ctrl(struct v4l2_ctrl *ctrl)
 		}
 
 		/*
-		 * Analog gain, reg range[0, 232], gain value[1, 10.66]
-		 * reg = 256 - 256 / again
-		 * a_gain here is 256 multify
-		 * so the reg = 256 - 256 * 256 / a_gain
-		 */
+         * Analog gain, reg range[0, 232], gain value[1, 10.66]
+         * reg = 256 - 256 / again
+         * a_gain here is 256 multify
+         * so the reg = 256 - 256 * 256 / a_gain
+         */
 		priv->analogue_gain = (256 - (256 * 256) / a_gain);
 		if (a_gain < 256)
 			priv->analogue_gain = 0;
@@ -750,9 +823,9 @@ static int imx219_s_ctrl(struct v4l2_ctrl *ctrl)
 			priv->analogue_gain = 232;
 
 		/*
-		 * Digital gain, reg range[256, 4095], gain rage[1, 16]
-		 * reg = dgain * 256
-		 */
+         * Digital gain, reg range[256, 4095], gain rage[1, 16]
+         * reg = dgain * 256
+         */
 		priv->digital_gain = d_gain;
 		if (priv->digital_gain < 256)
 			priv->digital_gain = 256;
@@ -760,10 +833,10 @@ static int imx219_s_ctrl(struct v4l2_ctrl *ctrl)
 			priv->digital_gain = 4095;
 
 		/*
-		 * for bank A and bank B switch
-		 * exposure time , gain, vts must change at the same time
-		 * so the exposure & gain can reflect at the same frame
-		 */
+         * for bank A and bank B switch
+         * exposure time , gain, vts must change at the same time
+         * so the exposure & gain can reflect at the same frame
+         */
 
 		ret = reg_write(client, 0x0157, priv->analogue_gain);
 		ret |= reg_write(client, 0x0158, priv->digital_gain >> 8);
@@ -819,8 +892,8 @@ static int imx219_get_reso_dist(const struct imx219_mode *mode,
 	       abs(mode->height - framefmt->height);
 }
 
-static const struct imx219_mode *imx219_find_best_fit(
-					struct v4l2_subdev_format *fmt)
+static const struct imx219_mode *
+imx219_find_best_fit(struct v4l2_subdev_format *fmt)
 {
 	struct v4l2_mbus_framefmt *framefmt = &fmt->format;
 	int dist;
@@ -846,40 +919,49 @@ static int imx219_set_fmt(struct v4l2_subdev *sd,
 	struct i2c_client *client = v4l2_get_subdevdata(sd);
 	struct imx219 *priv = to_imx219(client);
 	const struct imx219_mode *mode;
+	struct v4l2_mbus_framefmt *state_format;
+	struct v4l2_rect *crop;
 	s64 h_blank, v_blank, pixel_rate;
 	u32 fps = 0;
 
-	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
-		return 0;
+	if (fmt->pad)
+		return -EINVAL;
 
 	mode = imx219_find_best_fit(fmt);
-	fmt->format.code = MEDIA_BUS_FMT_SRGGB10_1X10;
-	fmt->format.width = mode->width;
-	fmt->format.height = mode->height;
-	fmt->format.field = V4L2_FIELD_NONE;
-	priv->cur_mode = mode;
-	h_blank = mode->hts_def - mode->width;
-	__v4l2_ctrl_modify_range(priv->hblank, h_blank,
-					h_blank, 1, h_blank);
-	v_blank = mode->vts_def - mode->height;
-	__v4l2_ctrl_modify_range(priv->vblank, v_blank,
-					v_blank,
-					1, v_blank);
-	fps = DIV_ROUND_CLOSEST(mode->max_fps.denominator,
-		mode->max_fps.numerator);
-	pixel_rate = mode->vts_def * mode->hts_def * fps;
-	__v4l2_ctrl_modify_range(priv->pixel_rate, pixel_rate,
-					pixel_rate, 1, pixel_rate);
+	imx219_update_pad_format(mode, &fmt->format);
 
-	/* reset crop window */
-	priv->crop_rect.left = 1640 - (mode->width / 2);
-	if (priv->crop_rect.left < 0)
-		priv->crop_rect.left = 0;
-	priv->crop_rect.top = 1232 - (mode->height / 2);
-	if (priv->crop_rect.top < 0)
-		priv->crop_rect.top = 0;
-	priv->crop_rect.width = mode->width;
-	priv->crop_rect.height = mode->height;
+	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
+		state_format =
+			v4l2_subdev_get_try_format(sd, sd_state, fmt->pad);
+		if (!state_format)
+			return -EINVAL;
+		*state_format = fmt->format;
+
+		crop = v4l2_subdev_get_try_crop(sd, sd_state, fmt->pad);
+		if (!crop)
+			return -EINVAL;
+		imx219_compose_centered_crop(crop, state_format);
+
+		fmt->format = *state_format;
+		return 0;
+	}
+
+	priv->cur_mode = mode;
+	priv->fmt = fmt->format;
+	imx219_compose_centered_crop(&priv->crop_rect, &priv->fmt);
+
+	h_blank = mode->hts_def - mode->width;
+	__v4l2_ctrl_modify_range(priv->hblank, h_blank, h_blank, 1, h_blank);
+
+	v_blank = mode->vts_def - mode->height;
+	__v4l2_ctrl_modify_range(priv->vblank, v_blank, v_blank, 1, v_blank);
+	fps = DIV_ROUND_CLOSEST(mode->max_fps.denominator,
+				mode->max_fps.numerator);
+	pixel_rate = imx219_get_pixel_rate(priv);
+	__v4l2_ctrl_modify_range(priv->pixel_rate, pixel_rate, pixel_rate, 1,
+				 pixel_rate);
+
+	fmt->format = priv->fmt;
 
 	return 0;
 }
@@ -891,16 +973,65 @@ static int imx219_get_fmt(struct v4l2_subdev *sd,
 	struct i2c_client *client = v4l2_get_subdevdata(sd);
 	struct imx219 *priv = to_imx219(client);
 	const struct imx219_mode *mode = priv->cur_mode;
+	struct v4l2_mbus_framefmt *state_format;
 
-	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
-		return 0;
+	if (fmt->pad)
+		return -EINVAL;
 
-	fmt->format.width = mode->width;
-	fmt->format.height = mode->height;
-	fmt->format.code = MEDIA_BUS_FMT_SRGGB10_1X10;
-	fmt->format.field = V4L2_FIELD_NONE;
+	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
+		state_format =
+			v4l2_subdev_get_try_format(sd, sd_state, fmt->pad);
+		if (!state_format)
+			return -EINVAL;
+		fmt->format = *state_format;
+	} else {
+		fmt->format = priv->fmt;
+		/* Ensure metadata aligns with the current mode */
+		imx219_update_pad_format(mode, &fmt->format);
+	}
 
 	return 0;
+}
+
+static int imx219_get_selection(struct v4l2_subdev *sd,
+				struct v4l2_subdev_state *sd_state,
+				struct v4l2_subdev_selection *sel)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(sd);
+	struct imx219 *priv = to_imx219(client);
+	struct v4l2_rect *crop;
+	if (sel->pad)
+		return -EINVAL;
+
+	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP:
+		if (sel->which == V4L2_SUBDEV_FORMAT_TRY) {
+			crop = v4l2_subdev_get_try_crop(sd, sd_state, sel->pad);
+			if (!crop)
+				return -EINVAL;
+			sel->r = *crop;
+		} else {
+			sel->r = priv->crop_rect;
+		}
+		return 0;
+
+	case V4L2_SEL_TGT_NATIVE_SIZE:
+		sel->r.top = 0;
+		sel->r.left = 0;
+		sel->r.width = IMX219_NATIVE_WIDTH;
+		sel->r.height = IMX219_NATIVE_HEIGHT;
+		return 0;
+
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+		sel->r.top = IMX219_PIXEL_ARRAY_TOP;
+		sel->r.left = IMX219_PIXEL_ARRAY_LEFT;
+		sel->r.width = IMX219_PIXEL_ARRAY_WIDTH;
+		sel->r.height = IMX219_PIXEL_ARRAY_HEIGHT;
+		return 0;
+	}
+
+	return -EINVAL;
 }
 
 static void imx219_get_module_inf(struct imx219 *imx219,
@@ -932,8 +1063,8 @@ static long imx219_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 }
 
 #ifdef CONFIG_COMPAT
-static long imx219_compat_ioctl32(struct v4l2_subdev *sd,
-				  unsigned int cmd, unsigned long arg)
+static long imx219_compat_ioctl32(struct v4l2_subdev *sd, unsigned int cmd,
+				  unsigned long arg)
 {
 	void __user *up = compat_ptr(arg);
 	struct rkmodule_inf *inf;
@@ -977,18 +1108,19 @@ static long imx219_compat_ioctl32(struct v4l2_subdev *sd,
 static int imx219_g_mbus_config(struct v4l2_subdev *sd, unsigned int pad_id,
 				struct v4l2_mbus_config *config)
 {
-	//struct i2c_client *client = v4l2_get_subdevdata(sd);
-	//struct imx219 *imx219 = to_imx219(client);
+	struct i2c_client *client = v4l2_get_subdevdata(sd);
+	struct imx219 *priv = to_imx219(client);
 
 	config->type = V4L2_MBUS_CSI2_DPHY;
-	config->bus.mipi_csi2.num_data_lanes = IMX219_LANES;
+	config->bus.mipi_csi2.num_data_lanes = priv->lanes;
 
 	return 0;
 }
 
-static int imx219_enum_frame_interval(struct v4l2_subdev *sd,
-				       struct v4l2_subdev_state *sd_state,
-				       struct v4l2_subdev_frame_interval_enum *fie)
+static int
+imx219_enum_frame_interval(struct v4l2_subdev *sd,
+			   struct v4l2_subdev_state *sd_state,
+			   struct v4l2_subdev_frame_interval_enum *fie)
 {
 	struct i2c_client *client = v4l2_get_subdevdata(sd);
 	struct imx219 *priv = to_imx219(client);
@@ -1002,6 +1134,24 @@ static int imx219_enum_frame_interval(struct v4l2_subdev *sd,
 	fie->width = supported_modes[fie->index].width;
 	fie->height = supported_modes[fie->index].height;
 	fie->interval = supported_modes[fie->index].max_fps;
+	return 0;
+}
+
+static int imx219_enum_frame_size(struct v4l2_subdev *sd,
+				  struct v4l2_subdev_state *sd_state,
+				  struct v4l2_subdev_frame_size_enum *fse)
+{
+	if (fse->index >= ARRAY_SIZE(supported_modes))
+		return -EINVAL;
+
+	if (fse->code != MEDIA_BUS_FMT_SRGGB10_1X10)
+		return -EINVAL;
+
+	fse->min_width = supported_modes[fse->index].width;
+	fse->max_width = supported_modes[fse->index].width;
+	fse->min_height = supported_modes[fse->index].height;
+	fse->max_height = supported_modes[fse->index].height;
+
 	return 0;
 }
 
@@ -1021,9 +1171,11 @@ static struct v4l2_subdev_core_ops imx219_subdev_core_ops = {
 
 static const struct v4l2_subdev_pad_ops imx219_subdev_pad_ops = {
 	.enum_mbus_code = imx219_enum_mbus_code,
+	.enum_frame_size = imx219_enum_frame_size,
 	.enum_frame_interval = imx219_enum_frame_interval,
 	.set_fmt = imx219_set_fmt,
 	.get_fmt = imx219_get_fmt,
+	.get_selection = imx219_get_selection,
 	.get_mbus_config = imx219_g_mbus_config,
 };
 
@@ -1106,8 +1258,8 @@ static int imx219_video_probe(struct i2c_client *client)
 		goto done;
 	}
 	dev_info(&client->dev,
-		 "Model ID 0x%04x, Lot ID 0x%06x, Chip ID 0x%04x\n",
-		 model_id, lot_id, chip_id);
+		 "Model ID 0x%04x, Lot ID 0x%06x, Chip ID 0x%04x\n", model_id,
+		 lot_id, chip_id);
 done:
 	imx219_s_power(subdev, 0);
 	return ret;
@@ -1119,48 +1271,59 @@ static int imx219_ctrls_init(struct v4l2_subdev *sd)
 	struct imx219 *priv = to_imx219(client);
 	const struct imx219_mode *mode = priv->cur_mode;
 	s64 pixel_rate, h_blank, v_blank;
+	const s64 *link_freq_menu;
+	unsigned int link_freq_items;
 	int ret;
 	u32 fps = 0;
 
 	v4l2_ctrl_handler_init(&priv->ctrl_handler, 10);
-	v4l2_ctrl_new_std(&priv->ctrl_handler, &imx219_ctrl_ops,
-			  V4L2_CID_HFLIP, 0, 1, 1, 0);
-	v4l2_ctrl_new_std(&priv->ctrl_handler, &imx219_ctrl_ops,
-			  V4L2_CID_VFLIP, 0, 1, 1, 0);
+	v4l2_ctrl_new_std(&priv->ctrl_handler, &imx219_ctrl_ops, V4L2_CID_HFLIP,
+			  0, 1, 1, 0);
+	v4l2_ctrl_new_std(&priv->ctrl_handler, &imx219_ctrl_ops, V4L2_CID_VFLIP,
+			  0, 1, 1, 0);
 
 	/* exposure */
 	v4l2_ctrl_new_std(&priv->ctrl_handler, &imx219_ctrl_ops,
-			  V4L2_CID_ANALOGUE_GAIN,
-			  IMX219_ANALOGUE_GAIN_MIN,
-			  IMX219_ANALOGUE_GAIN_MAX,
-			  1, IMX219_ANALOGUE_GAIN_DEFAULT);
-	v4l2_ctrl_new_std(&priv->ctrl_handler, &imx219_ctrl_ops,
-			  V4L2_CID_GAIN,
-			  IMX219_DIGITAL_GAIN_MIN,
-			  IMX219_DIGITAL_GAIN_MAX, 1,
+			  V4L2_CID_ANALOGUE_GAIN, IMX219_ANALOGUE_GAIN_MIN,
+			  IMX219_ANALOGUE_GAIN_MAX, 1,
+			  IMX219_ANALOGUE_GAIN_DEFAULT);
+	v4l2_ctrl_new_std(&priv->ctrl_handler, &imx219_ctrl_ops, V4L2_CID_GAIN,
+			  IMX219_DIGITAL_GAIN_MIN, IMX219_DIGITAL_GAIN_MAX, 1,
 			  IMX219_DIGITAL_GAIN_DEFAULT);
 	v4l2_ctrl_new_std(&priv->ctrl_handler, &imx219_ctrl_ops,
-			  V4L2_CID_EXPOSURE,
-			  IMX219_DIGITAL_EXPOSURE_MIN,
+			  V4L2_CID_EXPOSURE, IMX219_DIGITAL_EXPOSURE_MIN,
 			  IMX219_DIGITAL_EXPOSURE_MAX, 1,
 			  IMX219_DIGITAL_EXPOSURE_DEFAULT);
 
 	/* blank */
 	h_blank = mode->hts_def - mode->width;
-	priv->hblank = v4l2_ctrl_new_std(&priv->ctrl_handler, NULL, V4L2_CID_HBLANK,
-			  h_blank, h_blank, 1, h_blank);
+	priv->hblank = v4l2_ctrl_new_std(&priv->ctrl_handler, NULL,
+					 V4L2_CID_HBLANK, h_blank, h_blank, 1,
+					 h_blank);
 	v_blank = mode->vts_def - mode->height;
-	priv->vblank = v4l2_ctrl_new_std(&priv->ctrl_handler, NULL, V4L2_CID_VBLANK,
-			  v_blank, v_blank, 1, v_blank);
+	priv->vblank = v4l2_ctrl_new_std(&priv->ctrl_handler, NULL,
+					 V4L2_CID_VBLANK, v_blank, v_blank, 1,
+					 v_blank);
 
 	/* freq */
-	v4l2_ctrl_new_int_menu(&priv->ctrl_handler, NULL, V4L2_CID_LINK_FREQ,
-			       0, 0, link_freq_menu_items);
+	link_freq_menu = (priv->lanes == 4) ? link_freq_menu_4lanes :
+					      link_freq_menu_2lanes;
+	link_freq_items = (priv->lanes == 4) ?
+				  ARRAY_SIZE(link_freq_menu_4lanes) :
+				  ARRAY_SIZE(link_freq_menu_2lanes);
+	priv->link_freq = v4l2_ctrl_new_int_menu(&priv->ctrl_handler, NULL,
+						 V4L2_CID_LINK_FREQ,
+						 link_freq_items - 1, 0,
+						 link_freq_menu);
+	if (priv->link_freq)
+		priv->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+
 	fps = DIV_ROUND_CLOSEST(mode->max_fps.denominator,
-		mode->max_fps.numerator);
-	pixel_rate = mode->vts_def * mode->hts_def * fps;
-	priv->pixel_rate = v4l2_ctrl_new_std(&priv->ctrl_handler, NULL, V4L2_CID_PIXEL_RATE,
-			  0, pixel_rate, 1, pixel_rate);
+				mode->max_fps.numerator);
+	pixel_rate = imx219_get_pixel_rate(priv);
+	priv->pixel_rate = v4l2_ctrl_new_std(&priv->ctrl_handler, NULL,
+					     V4L2_CID_PIXEL_RATE, 0, pixel_rate,
+					     1, pixel_rate);
 
 	v4l2_ctrl_new_std_menu_items(&priv->ctrl_handler, &imx219_ctrl_ops,
 				     V4L2_CID_TEST_PATTERN,
@@ -1187,6 +1350,61 @@ error:
 	return ret;
 }
 
+static bool imx219_endpoint_supports_freq(const struct v4l2_fwnode_endpoint *ep,
+					  const s64 *menu, size_t menu_size)
+{
+	size_t i, j;
+
+	for (i = 0; i < ep->nr_of_link_frequencies; i++)
+		for (j = 0; j < menu_size; j++)
+			if (ep->link_frequencies[i] == menu[j])
+				return true;
+
+	return false;
+}
+
+static int imx219_parse_hwcfg(struct device *dev, struct imx219 *priv)
+{
+	struct fwnode_handle *endpoint;
+	struct v4l2_fwnode_endpoint ep_cfg = {
+		.bus_type = V4L2_MBUS_CSI2_DPHY,
+	};
+	const s64 *menu;
+	size_t menu_size;
+	int ret = 0;
+
+	endpoint = fwnode_graph_get_next_endpoint(dev_fwnode(dev), NULL);
+	if (!endpoint)
+		return dev_err_probe(dev, -EINVAL, "endpoint node not found\n");
+
+	ret = v4l2_fwnode_endpoint_parse(endpoint, &ep_cfg);
+	fwnode_handle_put(endpoint);
+	if (ret) {
+		dev_err(dev, "could not parse endpoint\n");
+		return ret;
+	}
+
+	if (ep_cfg.bus.mipi_csi2.num_data_lanes != 2 &&
+	    ep_cfg.bus.mipi_csi2.num_data_lanes != 4) {
+		dev_err(dev, "only 2 or 4 data lanes are supported\n");
+		return -EINVAL;
+	}
+
+	priv->lanes = ep_cfg.bus.mipi_csi2.num_data_lanes;
+	menu = (priv->lanes == 4) ? link_freq_menu_4lanes :
+				    link_freq_menu_2lanes;
+	menu_size = (priv->lanes == 4) ? ARRAY_SIZE(link_freq_menu_4lanes) :
+					 ARRAY_SIZE(link_freq_menu_2lanes);
+
+	if (!imx219_endpoint_supports_freq(&ep_cfg, menu, menu_size)) {
+		dev_err(dev,
+			"Endpoint link frequency not supported by driver\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int imx219_probe(struct i2c_client *client,
 			const struct i2c_device_id *did)
 {
@@ -1198,10 +1416,8 @@ static int imx219_probe(struct i2c_client *client,
 	char facing[2];
 	int ret;
 
-	dev_info(dev, "driver version: %02x.%02x.%02x",
-		DRIVER_VERSION >> 16,
-		(DRIVER_VERSION & 0xff00) >> 8,
-		DRIVER_VERSION & 0x00ff);
+	dev_info(dev, "driver version: %02x.%02x.%02x", DRIVER_VERSION >> 16,
+		 (DRIVER_VERSION & 0xff00) >> 8, DRIVER_VERSION & 0x00ff);
 
 	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_BYTE_DATA)) {
 		dev_warn(&adapter->dev,
@@ -1211,6 +1427,7 @@ static int imx219_probe(struct i2c_client *client,
 	priv = devm_kzalloc(&client->dev, sizeof(struct imx219), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
+	priv->lanes = IMX219_LANES;
 
 	ret = of_property_read_u32(node, RKMODULE_CAMERA_MODULE_INDEX,
 				   &priv->module_index);
@@ -1224,6 +1441,10 @@ static int imx219_probe(struct i2c_client *client,
 		dev_err(dev, "could not get module information!\n");
 		return -EINVAL;
 	}
+
+	ret = imx219_parse_hwcfg(dev, priv);
+	if (ret)
+		return ret;
 
 	priv->clk = devm_clk_get(&client->dev, NULL);
 	if (IS_ERR(priv->clk)) {
@@ -1240,6 +1461,8 @@ static int imx219_probe(struct i2c_client *client,
 	// priv->crop_rect.top = 692;
 	priv->crop_rect.width = priv->cur_mode->width;
 	priv->crop_rect.height = priv->cur_mode->height;
+	imx219_update_pad_format(priv->cur_mode, &priv->fmt);
+	imx219_compose_centered_crop(&priv->crop_rect, &priv->fmt);
 
 	v4l2_i2c_subdev_init(&priv->subdev, client, &imx219_subdev_ops);
 	ret = imx219_ctrls_init(&priv->subdev);
@@ -1250,7 +1473,7 @@ static int imx219_probe(struct i2c_client *client,
 		return ret;
 
 	priv->subdev.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE |
-		     V4L2_SUBDEV_FL_HAS_EVENTS;
+			      V4L2_SUBDEV_FL_HAS_EVENTS;
 
 	priv->pad.flags = MEDIA_PAD_FL_SOURCE;
 	priv->subdev.entity.function = MEDIA_ENT_F_CAM_SENSOR;
@@ -1266,8 +1489,7 @@ static int imx219_probe(struct i2c_client *client,
 		facing[0] = 'f';
 
 	snprintf(sd->name, sizeof(sd->name), "m%02d_%s_%s %s",
-		 priv->module_index, facing,
-		 IMX219_NAME, dev_name(sd->dev));
+		 priv->module_index, facing, IMX219_NAME, dev_name(sd->dev));
 	ret = v4l2_async_register_subdev_sensor(sd);
 	if (ret < 0)
 		return ret;
@@ -1282,13 +1504,9 @@ static void imx219_remove(struct i2c_client *client)
 	v4l2_async_unregister_subdev(&priv->subdev);
 	media_entity_cleanup(&priv->subdev.entity);
 	v4l2_ctrl_handler_free(&priv->ctrl_handler);
-
 }
 
-static const struct i2c_device_id imx219_id[] = {
-	{"imx219", 0},
-	{}
-};
+static const struct i2c_device_id imx219_id[] = { { "imx219", 0 }, {} };
 
 static const struct of_device_id imx219_of_match[] = {
 	{ .compatible = "sony,imx219" },
@@ -1298,13 +1516,13 @@ MODULE_DEVICE_TABLE(of, imx219_of_match);
 
 MODULE_DEVICE_TABLE(i2c, imx219_id);
 static struct i2c_driver imx219_i2c_driver = {
-	.driver = {
-		.of_match_table = of_match_ptr(imx219_of_match),
-		.name = IMX219_NAME,
-	},
-	.probe = imx219_probe,
-	.remove = imx219_remove,
-	.id_table = imx219_id,
+    .driver = {
+        .of_match_table = of_match_ptr(imx219_of_match),
+        .name = IMX219_NAME,
+    },
+    .probe = imx219_probe,
+    .remove = imx219_remove,
+    .id_table = imx219_id,
 };
 
 module_i2c_driver(imx219_i2c_driver);
